@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Arch Linux — MacBook Pro 2012
-# Dual SSD · LUKS2 · Btrfs · systemd-boot · Hyprland
+# Dual SSD · LUKS2 · Btrfs · systemd-boot · linux-lts · Bluetooth · No GUI
 # =============================================================================
 # Run from Arch live ISO as root.
 # Usage: bash arch-install.sh
@@ -26,8 +26,8 @@ header(){ echo -e "\n${BOLD}=== $* ===${NC}"; }
 # -----------------------------------------------------------------------------
 DISK1="/dev/sda"
 DISK2="/dev/sdb"
-HOSTNAME="batou"
-USERNAME="dawid"
+HOSTNAME="archbook"
+USERNAME="user"
 TIMEZONE="Europe/Berlin"
 LOCALE="de_DE.UTF-8"
 KEYMAP="de-latin1-nodeadkeys"
@@ -62,7 +62,6 @@ read -rsp "LUKS passphrase: "          LUKS_PASS;  echo
 read -rsp "LUKS passphrase (confirm): " LUKS_CONF;  echo
 [[ "$LUKS_PASS" == "$LUKS_CONF" ]] || die "LUKS passphrases do not match"
 
-read -rsp "Root password: "            ROOT_PASS;  echo
 read -rsp "Password for $USERNAME: "   USER_PASS;  echo
 
 # -----------------------------------------------------------------------------
@@ -107,7 +106,7 @@ sgdisk --new=1:0:0 --typecode=1:8309 \
        --change-name=1:LUKS1 "$DISK2"
 
 partprobe "$DISK1" "$DISK2"
-sleep 2
+udevadm settle
 ok "Partitions created"
 
 # -----------------------------------------------------------------------------
@@ -120,19 +119,20 @@ LUKS0_PART="${DISK1}2"
 LUKS1_PART="${DISK2}1"
 
 info "Formatting $LUKS0_PART"
-echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 "$LUKS0_PART" -
+echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode "$LUKS0_PART" -
 
 info "Formatting $LUKS1_PART"
-echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 "$LUKS1_PART" -
+echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode "$LUKS1_PART" -
 
 info "Opening LUKS devices"
-echo -n "$LUKS_PASS" | cryptsetup open "$LUKS0_PART" crypt0 -
-echo -n "$LUKS_PASS" | cryptsetup open "$LUKS1_PART" crypt1 -
+echo -n "$LUKS_PASS" | cryptsetup open --key-file=- "$LUKS0_PART" crypt0
+echo -n "$LUKS_PASS" | cryptsetup open --key-file=- "$LUKS1_PART" crypt1
 
 info "Generating keyfile for crypt1"
 dd if=/dev/urandom bs=512 count=4 of=/crypto_keyfile.bin 2>/dev/null
 chmod 000 /crypto_keyfile.bin
-echo -n "$LUKS_PASS" | cryptsetup luksAddKey "$LUKS1_PART" /crypto_keyfile.bin -
+# -d - authorises with existing passphrase from stdin; keyfile is the new key to add
+echo -n "$LUKS_PASS" | cryptsetup luksAddKey --batch-mode -d - "$LUKS1_PART" /crypto_keyfile.bin
 ok "LUKS ready"
 
 # -----------------------------------------------------------------------------
@@ -168,17 +168,16 @@ ok "Btrfs mounted"
 header "pacstrap"
 
 pacstrap /mnt \
-    base linux linux-lts linux-firmware \
+    base linux-lts linux-firmware \
     btrfs-progs intel-ucode \
     networkmanager sudo vim \
-    broadcom-wl-dkms linux-headers linux-lts-headers \
-    pipewire pipewire-pulse wireplumber \
+    broadcom-wl-dkms linux-lts-headers \
+    bluez bluez-utils \
+    acpi acpid \
     brightnessctl tlp tlp-rdw thermald \
     cpupower earlyoom zram-generator \
-    hyprland alacritty wofi ly \
-    waybar mako grim slurp \
-    noto-fonts noto-fonts-emoji \
     reflector snapper snap-pac \
+    openssh \
     ufw git base-devel
 
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -204,11 +203,11 @@ UUID_SDA2=$(blkid -s UUID -o value "$LUKS0_PART")
 UUID_SDB1=$(blkid -s UUID -o value "$LUKS1_PART")
 
 arch-chroot /mnt /bin/bash -s "$HOSTNAME" "$USERNAME" "$TIMEZONE" "$LOCALE" \
-    "$KEYMAP" "$ROOT_PASS" "$USER_PASS" "$UUID_SDA2" "$UUID_SDB1" << 'CHROOT'
+    "$KEYMAP" "$USER_PASS" "$UUID_SDA2" "$UUID_SDB1" << 'CHROOT'
 
 HOSTNAME="$1"; USERNAME="$2"; TIMEZONE="$3"; LOCALE="$4"
-KEYMAP="$5";   ROOT_PASS="$6"; USER_PASS="$7"
-UUID_SDA2="$8"; UUID_SDB1="$9"
+KEYMAP="$5";   USER_PASS="$6"
+UUID_SDA2="$7"; UUID_SDB1="$8"
 
 set -euo pipefail
 
@@ -222,17 +221,18 @@ echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen
 echo "LANG=${LOCALE}" > /etc/locale.conf
 
-# Keymap
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 
 # Hostname
 echo "$HOSTNAME" > /etc/hostname
 
-# Passwords & user
-echo "root:${ROOT_PASS}" | chpasswd
-useradd -mG wheel,video,audio,input "$USERNAME"
+# User — root account locked, sudo via wheel
+useradd -mG wheel,bluetooth "$USERNAME"
 echo "${USERNAME}:${USER_PASS}" | chpasswd
+passwd -l root
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+# Keymap — must exist before mkinitcpio sd-vconsole hook
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 
 # mkinitcpio
 cat > /etc/mkinitcpio.conf << 'EOF'
@@ -243,7 +243,6 @@ HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole sd-enc
 EOF
 
 mkinitcpio -P
-chmod 600 /boot/initramfs-linux*
 chmod 600 /boot/initramfs-linux-lts*
 
 # Broadcom blacklist
@@ -262,7 +261,7 @@ EOF
 bootctl install
 
 cat > /boot/loader/loader.conf << 'EOF'
-default arch.conf
+default arch-lts.conf
 timeout 4
 editor no
 EOF
@@ -273,14 +272,6 @@ root=/dev/mapper/crypt0 rootflags=subvol=@ \
 rw quiet mem_sleep_default=deep \
 i915.enable_psr=0 i915.enable_rc6=1 i915.enable_fbc=1 \
 intel_pstate=active nmi_watchdog=0 pcie_aspm=force"
-
-cat > /boot/loader/entries/arch.conf << EOF
-title   Arch Linux
-linux   /vmlinuz-linux
-initrd  /intel-ucode.img
-initrd  /initramfs-linux.img
-options ${BOOT_OPTS}
-EOF
 
 cat > /boot/loader/entries/arch-lts.conf << EOF
 title   Arch Linux LTS
@@ -386,7 +377,6 @@ cat > /etc/pacman.d/hooks/mount-boot.hook << 'EOF'
 Operation = Install
 Operation = Upgrade
 Type = Package
-Target = linux
 Target = linux-lts
 
 [Action]
@@ -400,7 +390,6 @@ cat > /etc/pacman.d/hooks/umount-boot.hook << 'EOF'
 Operation = Install
 Operation = Upgrade
 Type = Package
-Target = linux
 Target = linux-lts
 
 [Action]
@@ -409,30 +398,21 @@ When = PostTransaction
 Exec = /usr/bin/umount /boot
 EOF
 
-# Hyprland keyboard config (skeleton)
-mkdir -p "/home/${USERNAME}/.config/hypr"
-cat > "/home/${USERNAME}/.config/hypr/hyprland.conf" << 'EOF'
-input {
-    kb_layout = de
-    kb_model  = macbook79
-    kb_variant = mac
-    follow_mouse = 1
-    touchpad {
-        natural_scroll = true
-    }
-}
+# SSH daemon config — disable root login, allow only key auth
+sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/'        /etc/ssh/sshd_config
+sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+sed -i 's/^#PubkeyAuthentication.*/PubkeyAuthentication yes/'    /etc/ssh/sshd_config
 
-exec-once = waybar
-exec-once = mako
-exec-once = nm-applet --indicator
-
-# Keybind: open terminal
-bind = SUPER, Return, exec, alacritty
-
-# Keybind: launcher
-bind = SUPER, D, exec, wofi --show drun
-EOF
-chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.config"
+# SSH key generation — name: user-hostname-date
+SSH_DATE=$(date +%Y%m%d)
+SSH_KEYNAME="${USERNAME}-${HOSTNAME}-${SSH_DATE}"
+SSH_DIR="/home/${USERNAME}/.ssh"
+mkdir -p "$SSH_DIR"
+ssh-keygen -t ed25519 -f "${SSH_DIR}/${SSH_KEYNAME}" -C "${SSH_KEYNAME}" -N ""
+chmod 700 "$SSH_DIR"
+chmod 600 "${SSH_DIR}/${SSH_KEYNAME}"
+chmod 644 "${SSH_DIR}/${SSH_KEYNAME}.pub"
+chown -R "${USERNAME}:${USERNAME}" "$SSH_DIR"
 
 # Snapper
 snapper -c root create-config /
@@ -440,11 +420,13 @@ snapper -c home  create-config /home
 
 # Enable services
 systemctl enable NetworkManager
+systemctl enable acpid
+systemctl enable sshd
+systemctl enable bluetooth
 systemctl enable tlp
 systemctl enable thermald
 systemctl enable cpupower
 systemctl enable earlyoom
-systemctl enable ly
 systemctl enable disable-xhc-wakeup
 systemctl enable reflector.timer
 systemctl enable fstrim.timer
@@ -469,6 +451,6 @@ cryptsetup close crypt1
 cryptsetup close crypt0
 
 echo -e "\n${GREEN}${BOLD}Installation complete. Remove installation media and reboot.${NC}"
-echo -e "  Boot entries: ${BOLD}Arch Linux${NC} / ${BOLD}Arch Linux LTS${NC}"
-echo -e "  Display manager: ${BOLD}ly${NC}"
+echo -e "  Boot entry:   ${BOLD}Arch Linux LTS${NC}"
+echo -e "  Bluetooth:    bluetoothctl"
 echo -e "  Post-install: install yay for AUR access\n"
