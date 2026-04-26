@@ -1,52 +1,59 @@
 #!/bin/bash
 
-# Configuration and User Input
+# Configuration
+loadkeys de-latin1
+timedatectl set-ntp true
+
 read -p "Enter username: " USERNAME
 read -p "Enter hostname: " HOSTNAME
-DISK1="/dev/sda"
-DISK2="/dev/sdb"
 
-# Partitioning (UEFI/GPT)
-sgdisk -Z $DISK1
-sgdisk -Z $DISK2
-sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" $DISK1
-sgdisk -n 2:0:0 -t 2:8309 -c 2:"CRYPT" $DISK1
-sgdisk -n 1:0:0 -t 1:8309 -c 1:"CRYPT" $DISK2
+# Disk Partitioning (sda & sdb)
+# Creating a 512MB EFI on sda, rest for LUKS. sdb fully LUKS.
+sgdisk -Z /dev/sda
+sgdisk -Z /dev/sdb
+sgdisk -n 1:0:+512M -t 1:ef00 /dev/sda
+sgdisk -n 2:0:0 -t 2:8309 /dev/sda
+sgdisk -n 1:0:0 -t 1:8309 /dev/sdb
 
-# Encryption Setup (LUKS2)
-echo "Enter LUKS Passphrase:"
-cryptsetup luksFormat $DISK1-part2
-cryptsetup luksFormat $DISK2-part1
-cryptsetup open $DISK1-part2 crypt1
-cryptsetup open $DISK2-part1 crypt2
+# Encryption Setup
+echo "Setting up LUKS on sda2..."
+cryptsetup luksFormat /dev/sda2
+echo "Setting up LUKS on sdb1..."
+cryptsetup luksFormat /dev/sdb1
 
-# Btrfs Multi-device Setup (RAID0 for capacity/performance)
-mkfs.btrfs -L ARCH -d raid0 -m raid1 /dev/mapper/crypt1 /dev/mapper/crypt2
-mount /dev/label/ARCH /mnt
+cryptsetup open /dev/sda2 crypt_sda
+cryptsetup open /dev/sdb1 crypt_sdb
 
-# Subvolumes
+# Btrfs RAID0 setup (Spanning both disks)
+mkfs.btrfs -L ARCH_ROOT -d raid0 -m raid1 /dev/mapper/crypt_sda /dev/mapper/crypt_sdb
+mount /dev/btrfs-control /mnt # Ensure control node exists
+mount /dev/mapper/crypt_sda /mnt
+
+# Create Subvolumes
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
-btrfs subvolume create /mnt/@pkg
+btrfs subvolume create /mnt/@snapshots
 umount /mnt
 
-# Mount with optimization
+# Mount with SSD optimizations
 MOUNT_OPTS="noatime,compress=zstd,ssd,discard=async,subvol="
-mount -o ${MOUNT_OPTS}@ /dev/label/ARCH /mnt
-mkdir -p /mnt/{boot,home,var/cache/pacman/pkg}
-mount -o ${MOUNT_OPTS}@home /dev/label/ARCH /mnt/home
-mount -o ${MOUNT_OPTS}@pkg /dev/label/ARCH /mnt/var/cache/pacman/pkg
-mount $DISK1-part1 /mnt/boot
+mount -o ${MOUNT_OPTS}@ /dev/mapper/crypt_sda /mnt
+mkdir -p /mnt/{home,.snapshots,boot}
+mount -o ${MOUNT_OPTS}@home /dev/mapper/crypt_sda /mnt/home
+mount -o ${MOUNT_OPTS}@snapshots /dev/mapper/crypt_sda /mnt/.snapshots
+mount /dev/sda1 /mnt/boot
 
-# Base System and MacBook Specifics
-pacstrap /mnt base linux-lts linux-lts-headers linux-firmware broadcom-wl-dkms btrfs-progs sudo nvi
+# Install Base System
+pacstrap /mnt base base-devel linux-lts linux-lts-headers linux-firmware \
+btrfs-progs broadcom-wl-dkms git vim sudo alacritty networkmanager \
+network-manager-applet bluez bluez-utils hyprland waybar wofi mako \
+xdg-desktop-portal-hyprland vivaldi openssh tlp acpi zram-generator
 
 # Fstab
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# Chroot Configuration
+# Chroot configuration
 arch-chroot /mnt /bin/bash <<EOF
-# Localization
 ln -sf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
 hwclock --systohc
 echo "de_DE.UTF-8 UTF-8" >> /etc/locale.gen
@@ -56,36 +63,42 @@ echo "KEYMAP=de-latin1" > /etc/vconsole.conf
 echo "$HOSTNAME" > /etc/hostname
 
 # Initramfs for Encryption and Btrfs
-sed -i 's/HOOKS=(base udev/HOOKS=(base udev autodetect modconf block encrypt btrfs/' /etc/mkinitcpio.conf
+sed -i 's/HOOKS=(base udev/HOOKS=(base udev autodetect modconf block encrypt filesystems keyboard fsck)/' /etc/mkinitcpio.conf
 mkinitcpio -p linux-lts
+
+# User setup
+useradd -m -G wheel -s /bin/zsh $USERNAME
+echo "$USERNAME ALL=(ALL) ALL" >> /etc/sudoers
+passwd -l root
+
+# SSH Key Generation
+DATE=\$(date +%Y%m%d)
+KEYNAME="/home/$USERNAME/.ssh/id_ed25519_\${HOSTNAME}_\${DATE}"
+mkdir -p /home/$USERNAME/.ssh
+ssh-keygen -t ed25519 -f "\$KEYNAME" -C "$USERNAME@$HOSTNAME"
+chown -R $USERNAME:$USERNAME /home/$USERNAME/.ssh
 
 # Bootloader (systemd-boot)
 bootctl install
-UUID1=$(blkid -s UUID -o value $DISK1-part2)
-UUID2=$(blkid -s UUID -o value $DISK2-part1)
-echo "title Arch Linux LTS
+UUID1=\$(blkid -s UUID -o value /dev/sda2)
+UUID2=\$(blkid -s UUID -o value /dev/sdb1)
+
+echo "default arch" > /boot/loader/loader.conf
+cat <<EOT > /boot/loader/entries/arch.conf
+title Arch Linux (LTS)
 linux /vmlinuz-linux-lts
 initrd /initrd-linux-lts.img
-options cryptdevice=UUID=\$UUID1:crypt1 cryptdevice=UUID=\$UUID2:crypt2 root=/dev/mapper/crypt1 rootflags=subvol=@ rw" > /boot/loader/entries/arch.conf
+options cryptdevice=UUID=\$UUID1:crypt_sda cryptdevice=UUID=\$UUID2:crypt_sdb root=/dev/mapper/crypt_sda rootflags=subvol=@ rw
+EOT
 
-# User Management
-useradd -m -G wheel -s /bin/zsh $USERNAME
-passwd $USERNAME
-echo "%wheel ALL=(ALL) ALL" > /etc/sudoers.d/wheel
-passwd -l root
+# Services & Optimizations
+systemctl enable NetworkManager bluetooth sshd tlp fstrim.timer
+echo -e "[zram0]\nzram-size = min(ram / 2, 4096)" > /etc/systemd/zram-generator.conf
 
-# SSH Setup
-pacman -S --noconfirm openssh
-systemctl enable sshd
-sudo -u $USERNAME ssh-keygen -t ed25519 -N "" -f /home/$USERNAME/.ssh/id_ed25519
-
-# Drivers and Power Management
-pacman -S --noconfirm tlp acpi bluez bluez-utils networkmanager network-manager-applet
-systemctl enable tlp bluetooth NetworkManager
-
-# Desktop Environment (Hyprland)
-pacman -S --noconfirm hyprland waybar wofi alacritty vivaldi polkit-kde-agent
+# MacBook specific: Prevent lid wake issues and fix backlight
+echo "options drm_info_cap=1" > /etc/modprobe.d/i915.conf
 EOF
 
 umount -R /mnt
-echo "Install complete. Reboot."
+swapoff -a
+echo "Installation complete. Reboot and set user password."
