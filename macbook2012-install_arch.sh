@@ -26,8 +26,8 @@ header(){ echo -e "\n${BOLD}=== $* ===${NC}"; }
 # -----------------------------------------------------------------------------
 DISK1="/dev/sda"
 DISK2="/dev/sdb"
-HOSTNAME="batou"
-USERNAME="dawid"
+HOSTNAME="archbook"
+USERNAME="user"
 TIMEZONE="Europe/Berlin"
 LOCALE="de_DE.UTF-8"
 KEYMAP="de-latin1-nodeadkeys"
@@ -210,6 +210,10 @@ HOSTNAME="$1"; USERNAME="$2"; TIMEZONE="$3"; LOCALE="$4"
 KEYMAP="$5";   USER_PASS="$6"
 UUID_SDA2="$7"; UUID_SDB1="$8"
 
+# Write vconsole.conf before anything else — sd-vconsole hook requires it
+# Done here before set -euo pipefail so a later failure cannot prevent it
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
+
 set -euo pipefail
 
 # Timezone & clock
@@ -232,8 +236,6 @@ echo "${USERNAME}:${USER_PASS}" | chpasswd
 passwd -l root
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# Keymap — must exist before mkinitcpio sd-vconsole hook
-echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 
 # mkinitcpio
 cat > /etc/mkinitcpio.conf << 'EOF'
@@ -243,6 +245,8 @@ FILES=(/crypto_keyfile.bin)
 HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole sd-encrypt filesystems fsck)
 EOF
 
+# Ensure vconsole.conf exists — guard against any earlier failure
+echo "KEYMAP=${KEYMAP}" > /etc/vconsole.conf
 mkinitcpio -P
 chmod 600 /boot/initramfs-linux-lts*
 
