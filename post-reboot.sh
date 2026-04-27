@@ -17,8 +17,8 @@ sudo flatpak remote-add --if-not-exists flathub \
 
 # --- ly display manager ------------------------------------------------------
 sudo pacman -S --needed --noconfirm ly
+sudo systemctl enable ly@tty2.service
 sudo systemctl disable --now getty@tty2.service 2>/dev/null || true
-sudo systemctl enable ly.service
 
 # --- Extra desktop tooling ---------------------------------------------------
 sudo pacman -S --needed --noconfirm \
