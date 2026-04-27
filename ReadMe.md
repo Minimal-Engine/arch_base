@@ -1,7 +1,7 @@
-# Arch Linux installer — 2012 non-retina MacBook Pro
+# Arch Linux installer — 2012 non-retina MacBook Pro 13" (MBP9,2)
 
-Encrypted Arch install for a MacBookPro9,1 / 9,2 modified with two 256 GB SATA SSDs
-(typical mod: main bay + optical-bay caddy).
+Encrypted Arch install for a MacBookPro9,2 (mid-2012, 13", Intel HD 4000 only)
+modified with two 256 GB SATA SSDs (typical mod: main bay + optical-bay caddy).
 
 ## Files
 
@@ -48,8 +48,7 @@ Encrypted Arch install for a MacBookPro9,1 / 9,2 modified with two 256 GB SATA S
   (`b43`, `bcma`, `ssb`, `brcmsmac`, `brcmfmac`) blacklisted.
 - **Apple keyboard.** `hid_apple` set to `fnmode=2` so F-keys are F-keys by default.
 - **Apple firmware quirks.** `acpi_osi="Darwin"` and `acpi_backlight=vendor` on the
-  kernel cmdline; `nouveau` blacklisted (matters on the 15" MBP9,1 with the
-  GT 650M — it black-screens otherwise).
+  kernel cmdline. (No nouveau blacklist needed — MBP9,2 is Intel-only.)
 - **ZRAM.** Half of RAM, capped at 8 GiB, `zstd` compression, swap-priority 100.
 - **TLP.** Tuned config in `/etc/tlp.conf.d/00-macbook.conf` — runtime PM, SATA
   link-power management, WiFi power save on battery.

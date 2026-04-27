@@ -181,12 +181,6 @@ applesmc
 coretemp
 EOF
 
-# Force i915 KMS, disable nouveau (MBP9,1 has Nvidia GT 650M; black-screen safe).
-cat > /etc/modprobe.d/blacklist-nouveau.conf <<EOF
-blacklist nouveau
-options nouveau modeset=0
-EOF
-
 # TLP defaults tuned for SATA SSDs + battery life
 cat > /etc/tlp.conf.d/00-macbook.conf <<EOF
 TLP_ENABLE=1
