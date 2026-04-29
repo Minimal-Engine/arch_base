@@ -1,188 +1,186 @@
 #!/usr/bin/env bash
-# Arch Linux installer for 2012 non-retina MacBook Pro (9,1 / 9,2)
-# Two SSDs, LUKS2 + Btrfs spanning both, systemd-boot, linux-lts.
-# Run from the Arch ISO live environment, booted in EFI mode.
+# ============================================================================
+# Arch Linux installer — Part 1/2 (pre-chroot)
+# Target: MacBook Pro 9,2 (mid-2012 non-retina 13", no dGPU), two SSDs.
 #
-# Place install.sh and chroot-config.sh in the same directory, then:
-#   bash install.sh
+# Run from the official Arch ISO (UEFI). Network must be up.
+# Expects chroot-config.sh to live in the same directory.
+#
+# Layout:
+#   DISK1: ESP (1 GiB, FAT32) + LUKS2 -> btrfs member 1 (cryptroot)
+#   DISK2: LUKS2                       -> btrfs member 2 (cryptroot2)
+#   btrfs: -d single -m raid1 (full capacity, metadata mirrored)
+#   Same LUKS passphrase on both -> sd-encrypt caches; one prompt at boot.
+# ============================================================================
 
 set -euo pipefail
 
-err() { echo "ERROR: $*" >&2; exit 1; }
+log()  { printf '\e[1;32m[+]\e[0m %s\n' "$*"; }
+warn() { printf '\e[1;33m[!]\e[0m %s\n' "$*"; }
+err()  { printf '\e[1;31m[x]\e[0m %s\n' "$*" >&2; exit 1; }
 
-[[ $EUID -eq 0 ]] || err "Run as root."
-[[ -d /sys/firmware/efi ]] || err "Not booted in EFI mode. On 2012 MBP, hold Option/Alt at boot and pick the EFI USB."
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+CHROOT_SCRIPT="${SCRIPT_DIR}/chroot-config.sh"
 
-# --- Prompt for user input ---------------------------------------------------
-echo "Available block devices:"
-lsblk -dn -o NAME,SIZE,MODEL | grep -v -E 'loop|sr0'
-echo
+# ---------- Sanity checks --------------------------------------------------
+[[ $EUID -eq 0 ]]                  || err "Run as root."
+[[ -d /sys/firmware/efi/efivars ]] || err "Not booted in UEFI mode."
+[[ -f "$CHROOT_SCRIPT" ]]          || err "Missing $CHROOT_SCRIPT next to this script."
+ping -c1 -W2 archlinux.org >/dev/null 2>&1 || err "No network. Connect first."
 
-read -rp "Disk 1 (will hold EFI + part of root, e.g. /dev/sda): " DISK1
-read -rp "Disk 2 (entire disk for root span, e.g. /dev/sdb):     " DISK2
-read -rp "Hostname:  " HOSTNAME
-read -rp "Username:  " USERNAME
+# ---------- Prompts --------------------------------------------------------
+read -rp "Hostname: "  HOSTNAME
+[[ -n "$HOSTNAME" ]] || err "Hostname required."
+read -rp "Username: "  USERNAME
+[[ -n "$USERNAME" ]] || err "Username required."
 
 while :; do
-  read -rsp "User password: " USER_PASS; echo
-  read -rsp "Confirm:       " USER_PASS2; echo
-  [[ "$USER_PASS" == "$USER_PASS2" ]] && break
-  echo "Mismatch, try again."
+    read -rsp "User password: " USER_PASS;  echo
+    read -rsp "Confirm:        " USER_PASS2; echo
+    [[ "$USER_PASS" == "$USER_PASS2" ]] && break
+    warn "Passwords differ. Retry."
 done
 
 while :; do
-  read -rsp "LUKS passphrase (used for BOTH disks): " LUKS_PASS; echo
-  read -rsp "Confirm:                                " LUKS_PASS2; echo
-  [[ "$LUKS_PASS" == "$LUKS_PASS2" ]] && break
-  echo "Mismatch, try again."
+    read -rsp "LUKS passphrase (used for both disks): " LUKS_PASS;  echo
+    read -rsp "Confirm:                                " LUKS_PASS2; echo
+    [[ "$LUKS_PASS" == "$LUKS_PASS2" ]] && break
+    warn "Passphrases differ. Retry."
 done
 
-[[ -b "$DISK1" ]] || err "$DISK1 is not a block device"
-[[ -b "$DISK2" ]] || err "$DISK2 is not a block device"
-[[ "$DISK1" != "$DISK2" ]] || err "Disks must be different"
+echo
+lsblk -dno NAME,SIZE,MODEL | grep -v -E '^(loop|sr)' || true
+echo
+read -rp "Primary disk   (ESP + root, e.g. /dev/sda): " DISK1
+read -rp "Secondary disk (root member 2,    /dev/sdb): " DISK2
+[[ -b "$DISK1" && -b "$DISK2" ]] || err "Disks must be block devices."
+[[ "$DISK1" != "$DISK2" ]]      || err "Disks must differ."
 
 echo
-echo "============================================================"
-echo "  THIS WILL ERASE EVERYTHING ON $DISK1 AND $DISK2"
-echo "============================================================"
-read -rp "Type YES (uppercase) to continue: " CONFIRM
+warn "ALL DATA on $DISK1 and $DISK2 will be DESTROYED."
+read -rp "Type YES to continue: " CONFIRM
 [[ "$CONFIRM" == "YES" ]] || err "Aborted."
 
-# --- Helpers -----------------------------------------------------------------
-part_name() {
-  # Append 'p' for nvme/mmcblk style names, otherwise nothing
-  local d=$1 n=$2
-  if [[ "$d" =~ (nvme|mmcblk|loop) ]]; then echo "${d}p${n}"; else echo "${d}${n}"; fi
+# Helper: build partition node name (handles nvme/mmc suffix)
+partname() {
+    case "$1" in
+        *nvme*|*mmcblk*) echo "${1}p${2}" ;;
+        *)               echo "${1}${2}"  ;;
+    esac
 }
 
-# --- Time --------------------------------------------------------------------
+# ---------- Time / mirrors -------------------------------------------------
+log "Syncing clock and refreshing keyring."
 timedatectl set-ntp true
+pacman -Sy --noconfirm archlinux-keyring
 
-# --- Wipe + partition --------------------------------------------------------
-echo "==> Partitioning"
-wipefs -af "$DISK1" "$DISK2"
-sgdisk -Zo "$DISK1"
-sgdisk -Zo "$DISK2"
+# ---------- Partitioning ---------------------------------------------------
+log "Wiping and partitioning $DISK1 and $DISK2."
+wipefs -af  "$DISK1" "$DISK2"
+sgdisk --zap-all "$DISK1"
+sgdisk --zap-all "$DISK2"
 
-# DISK1: 512 MiB ESP + remainder LUKS
-sgdisk -n 1:0:+512MiB -t 1:ef00 -c 1:EFI         "$DISK1"
-sgdisk -n 2:0:0       -t 2:8309 -c 2:cryptroot1  "$DISK1"
+sgdisk -n 1:0:+1GiB -t 1:ef00 -c 1:"ESP"        "$DISK1"
+sgdisk -n 2:0:0     -t 2:8309 -c 2:"cryptroot"  "$DISK1"
+sgdisk -n 1:0:0     -t 1:8309 -c 1:"cryptroot2" "$DISK2"
 
-# DISK2: full disk LUKS
-sgdisk -n 1:0:0       -t 1:8309 -c 1:cryptroot2  "$DISK2"
+partprobe "$DISK1" "$DISK2"; sleep 2
 
-partprobe "$DISK1" "$DISK2"
-sleep 2
+ESP=$(partname   "$DISK1" 1)
+LUKS1=$(partname "$DISK1" 2)
+LUKS2=$(partname "$DISK2" 1)
 
-EFI_PART=$(part_name "$DISK1" 1)
-LUKS1=$(part_name   "$DISK1" 2)
-LUKS2=$(part_name   "$DISK2" 1)
+# ---------- ESP + LUKS -----------------------------------------------------
+log "Formatting ESP."
+mkfs.fat -F32 -n ESP "$ESP"
 
-# --- Format ESP --------------------------------------------------------------
-echo "==> Formatting ESP at $EFI_PART"
-mkfs.fat -F32 -n EFI "$EFI_PART"
+log "Creating LUKS2 containers."
+luks_args=(--type luks2 --batch-mode --cipher aes-xts-plain64 --key-size 512
+           --hash sha256 --iter-time 4000 --pbkdf argon2id --use-urandom)
 
-# --- LUKS2 on both root partitions ------------------------------------------
-echo "==> Creating LUKS2 containers"
-echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --pbkdf argon2id \
-  --key-file - "$LUKS1"
-echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --pbkdf argon2id \
-  --key-file - "$LUKS2"
+printf '%s' "$LUKS_PASS" | cryptsetup luksFormat "${luks_args[@]}" --key-file=- "$LUKS1"
+printf '%s' "$LUKS_PASS" | cryptsetup luksFormat "${luks_args[@]}" --key-file=- "$LUKS2"
 
-echo -n "$LUKS_PASS" | cryptsetup open --allow-discards --key-file - "$LUKS1" cryptroot1
-echo -n "$LUKS_PASS" | cryptsetup open --allow-discards --key-file - "$LUKS2" cryptroot2
+log "Opening LUKS containers."
+printf '%s' "$LUKS_PASS" | cryptsetup open --allow-discards --key-file=- "$LUKS1" cryptroot
+printf '%s' "$LUKS_PASS" | cryptsetup open --allow-discards --key-file=- "$LUKS2" cryptroot2
 
-# --- Btrfs spanning both unlocked devices ------------------------------------
-# data=single (concatenation across devices, ~512 GiB usable)
-# metadata=raid1 (each metadata block on both devices for redundancy)
-echo "==> Creating Btrfs across both devices"
+# ---------- btrfs across both decrypted devices ----------------------------
+log "Creating btrfs spanning both LUKS volumes."
 mkfs.btrfs -f -L arch -d single -m raid1 \
-  /dev/mapper/cryptroot1 /dev/mapper/cryptroot2
+    /dev/mapper/cryptroot /dev/mapper/cryptroot2
 
-# --- Subvolumes --------------------------------------------------------------
-mount /dev/mapper/cryptroot1 /mnt
+# Subvolumes
+mount /dev/mapper/cryptroot /mnt
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
-btrfs subvolume create /mnt/@log
-btrfs subvolume create /mnt/@pkg
 btrfs subvolume create /mnt/@snapshots
+btrfs subvolume create /mnt/@var_log
+btrfs subvolume create /mnt/@var_cache
+btrfs subvolume create /mnt/@var_tmp
 umount /mnt
 
-BTRFS_OPTS="rw,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2"
+MOUNT_OPTS="noatime,compress=zstd:3,ssd,space_cache=v2,discard=async"
 
-mount -o "$BTRFS_OPTS,subvol=@"          /dev/mapper/cryptroot1 /mnt
-mkdir -p /mnt/{home,var/log,var/cache/pacman/pkg,.snapshots,boot}
-mount -o "$BTRFS_OPTS,subvol=@home"      /dev/mapper/cryptroot1 /mnt/home
-mount -o "$BTRFS_OPTS,subvol=@log"       /dev/mapper/cryptroot1 /mnt/var/log
-mount -o "$BTRFS_OPTS,subvol=@pkg"       /dev/mapper/cryptroot1 /mnt/var/cache/pacman/pkg
-mount -o "$BTRFS_OPTS,subvol=@snapshots" /dev/mapper/cryptroot1 /mnt/.snapshots
-mount "$EFI_PART" /mnt/boot
+mount -o "${MOUNT_OPTS},subvol=@"           /dev/mapper/cryptroot /mnt
+mkdir -p /mnt/{boot,home,.snapshots,var/log,var/cache,var/tmp}
+mount -o "${MOUNT_OPTS},subvol=@home"       /dev/mapper/cryptroot /mnt/home
+mount -o "${MOUNT_OPTS},subvol=@snapshots"  /dev/mapper/cryptroot /mnt/.snapshots
+mount -o "${MOUNT_OPTS},subvol=@var_log"    /dev/mapper/cryptroot /mnt/var/log
+mount -o "${MOUNT_OPTS},subvol=@var_cache"  /dev/mapper/cryptroot /mnt/var/cache
+mount -o "${MOUNT_OPTS},subvol=@var_tmp"    /dev/mapper/cryptroot /mnt/var/tmp
+chattr +C /mnt/var/cache /mnt/var/tmp || true
 
-# --- Pacstrap ----------------------------------------------------------------
-echo "==> Installing base system"
-PKGS=(
-  # Base
-  base base-devel linux-lts linux-lts-headers linux-firmware
-  btrfs-progs intel-ucode mkinitcpio
-  # Network / SSH / Bluetooth
-  networkmanager network-manager-applet
-  bluez bluez-utils
-  openssh
-  # Power / ACPI
-  acpi acpid tlp tlp-rdw
-  # Storage
-  util-linux cryptsetup
-  # Audio (Pipewire, recommended by Hyprland)
-  pipewire pipewire-alsa pipewire-pulse pipewire-jack wireplumber
-  pavucontrol alsa-utils
-  # zram
-  zram-generator
-  # Proprietary Broadcom WLAN (BCM4331 in MBP9,x) -- LTS variant
-  broadcom-wl-dkms
-  # Hyprland + recommended additional software
-  hyprland xdg-desktop-portal-hyprland xdg-desktop-portal
-  hyprpaper hyprlock hypridle
-  waybar wofi
-  qt5-wayland qt6-wayland
-  hyprpolkitagent
-  grim slurp swappy wl-clipboard cliphist
-  mako brightnessctl playerctl
-  thunar thunar-archive-plugin file-roller gvfs
-  alacritty
-  # Fonts
-  ttf-jetbrains-mono-nerd noto-fonts noto-fonts-emoji noto-fonts-cjk
-  ttf-liberation
-  # Utilities
-  sudo nano vim git curl wget rsync man-db man-pages
-  reflector pacman-contrib
-  xdg-user-dirs xdg-utils
-  bash-completion zsh
-)
+mount "$ESP" /mnt/boot
 
-pacstrap -K /mnt "${PKGS[@]}"
+# ---------- Pacstrap base system -------------------------------------------
+log "Running pacstrap (this takes a while)."
+pacstrap -K /mnt \
+    base base-devel linux-lts linux-lts-headers linux-firmware intel-ucode \
+    btrfs-progs cryptsetup efibootmgr \
+    networkmanager network-manager-applet nm-connection-editor \
+    bluez bluez-utils blueman \
+    tlp tlp-rdw acpi acpid \
+    broadcom-wl-dkms \
+    openssh sudo git \
+    zram-generator \
+    vim nano less htop man-db man-pages \
+    pacman-contrib reflector iputils inetutils usbutils pciutils \
+    bash-completion
 
-# --- fstab -------------------------------------------------------------------
 genfstab -U /mnt >> /mnt/etc/fstab
 
-# --- Hand off to chroot script ----------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-[[ -f "$SCRIPT_DIR/chroot-config.sh" ]] || err "chroot-config.sh missing next to install.sh"
+# ---------- Write env file + chroot script for Part 2 ----------------------
+LUKS1_UUID=$(blkid -s UUID -o value "$LUKS1")
+LUKS2_UUID=$(blkid -s UUID -o value "$LUKS2")
 
-cp "$SCRIPT_DIR/chroot-config.sh" /mnt/root/chroot-config.sh
-chmod +x /mnt/root/chroot-config.sh
+install -d -m 700 /mnt/root
+umask 077
+cat > /mnt/root/install.env <<EOF
+HOSTNAME='${HOSTNAME}'
+USERNAME='${USERNAME}'
+USER_PASS='${USER_PASS}'
+LUKS1_UUID='${LUKS1_UUID}'
+LUKS2_UUID='${LUKS2_UUID}'
+EOF
 
-arch-chroot /mnt /root/chroot-config.sh \
-  "$HOSTNAME" "$USERNAME" "$USER_PASS" "$LUKS1" "$LUKS2"
+install -m 755 "$CHROOT_SCRIPT" /mnt/root/chroot-config.sh
 
+log "Entering chroot to run Part 2."
+arch-chroot /mnt /root/chroot-config.sh
+
+# Wipe credentials.
+shred -u /mnt/root/install.env 2>/dev/null || rm -f /mnt/root/install.env
 rm -f /mnt/root/chroot-config.sh
 
-# --- Done --------------------------------------------------------------------
+# ---------- Done -----------------------------------------------------------
+log "Installation complete."
 echo
-echo "============================================================"
-echo "  Install complete."
-echo "  Run:   umount -R /mnt && cryptsetup close cryptroot1 && \\"
-echo "         cryptsetup close cryptroot2 && reboot"
+log "Public SSH key:"
+cat /mnt/home/"$USERNAME"/.ssh/id_ed25519_"${HOSTNAME}"_*.pub || true
 echo
-echo "  After reboot, log in and run post-reboot.sh as your user"
-echo "  to install Vivaldi and mbpfan from the AUR."
-echo "============================================================"
+log "Finish with:"
+echo "    umount -R /mnt"
+echo "    cryptsetup close cryptroot"
+echo "    cryptsetup close cryptroot2"
+echo "    reboot"
